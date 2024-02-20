@@ -74,7 +74,11 @@ export let current_effect = null;
 /** @type {null | import('./types.js').Signal[]} */
 let current_dependencies = null;
 let current_dependencies_index = 0;
-/** @type {null | import('./types.js').Signal[]} */
+/**
+ * Tracks writes that the effect it's executed in doesn't listen to yet,
+ * so that the dependency can be added to the effect later on if it then reads it
+ * @type {null | import('./types.js').Signal[]}
+ */
 let current_untracked_writes = null;
 /** @type {null | import('./types.js').SignalDebug} */
 let last_inspected_signal = null;
@@ -745,9 +749,22 @@ export function flush_local_pre_effects(context) {
  * @returns {void}
  */
 export function flushSync(fn) {
+	flush_sync(fn);
+}
+
+/**
+ * Internal version of `flushSync` with the option to not flush previous effects.
+ * Returns the result of the passed function, if given.
+ * @param {() => any} [fn]
+ * @param {boolean} [flush_previous]
+ * @returns {any}
+ */
+export function flush_sync(fn, flush_previous = true) {
 	const previous_scheduler_mode = current_scheduler_mode;
 	const previous_queued_pre_and_render_effects = current_queued_pre_and_render_effects;
 	const previous_queued_effects = current_queued_effects;
+	let result;
+
 	try {
 		infinite_loop_guard();
 		/** @type {import('./types.js').EffectSignal[]} */
@@ -758,10 +775,12 @@ export function flushSync(fn) {
 		current_scheduler_mode = FLUSH_SYNC;
 		current_queued_pre_and_render_effects = pre_and_render_effects;
 		current_queued_effects = effects;
-		flush_queued_effects(previous_queued_pre_and_render_effects);
-		flush_queued_effects(previous_queued_effects);
+		if (flush_previous) {
+			flush_queued_effects(previous_queued_pre_and_render_effects);
+			flush_queued_effects(previous_queued_effects);
+		}
 		if (fn !== undefined) {
-			fn();
+			result = fn();
 		}
 		if (current_queued_pre_and_render_effects.length > 0 || effects.length > 0) {
 			flushSync();
@@ -778,6 +797,8 @@ export function flushSync(fn) {
 		current_queued_pre_and_render_effects = previous_queued_pre_and_render_effects;
 		current_queued_effects = previous_queued_effects;
 	}
+
+	return result;
 }
 
 /**
@@ -803,7 +824,8 @@ function update_derived(signal, force_schedule) {
 	destroy_references(signal);
 	const value = execute_signal_fn(signal);
 	updating_derived = previous_updating_derived;
-	const status = current_skip_consumer || (signal.f & UNOWNED) !== 0 ? DIRTY : CLEAN;
+	const status =
+		(current_skip_consumer || (signal.f & UNOWNED) !== 0) && signal.d !== null ? DIRTY : CLEAN;
 	set_signal_status(signal, status);
 	const equals = /** @type {import('./types.js').EqualsFunctions} */ (signal.e);
 	if (!equals(value, signal.v)) {
@@ -1189,8 +1211,11 @@ export function set_signal_value(signal, value) {
 		//
 		// $effect(() => x++)
 		//
+		// We additionally want to skip this logic for when ignore_mutation_validation is
+		// true, as stores write to source signal on initialization.
 		if (
 			is_runes(null) &&
+			!ignore_mutation_validation &&
 			current_effect !== null &&
 			current_effect.c === null &&
 			(current_effect.f & CLEAN) !== 0
@@ -1567,16 +1592,20 @@ export function is_store(val) {
 export function prop(props, key, flags, initial) {
 	var immutable = (flags & PROPS_IS_IMMUTABLE) !== 0;
 	var runes = (flags & PROPS_IS_RUNES) !== 0;
-
-	var setter = get_descriptor(props, key)?.set;
-	if (DEV && setter && runes && initial !== undefined) {
-		// TODO consolidate all these random runtime errors
-		throw new Error('Cannot use fallback values with bind:');
-	}
-
 	var prop_value = /** @type {V} */ (props[key]);
+	var setter = get_descriptor(props, key)?.set;
 
 	if (prop_value === undefined && initial !== undefined) {
+		if (setter && runes) {
+			// TODO consolidate all these random runtime errors
+			throw new Error(
+				'ERR_SVELTE_BINDING_FALLBACK' +
+					(DEV
+						? `: Cannot pass undefined to bind:${key} because the property contains a fallback value. Pass a different value than undefined to ${key}.`
+						: '')
+			);
+		}
+
 		// @ts-expect-error would need a cumbersome method overload to type this
 		if ((flags & PROPS_IS_LAZY_INITIAL) !== 0) initial = initial();
 
@@ -1642,7 +1671,8 @@ export function prop(props, key, flags, initial) {
 		var current = get(current_value);
 
 		// legacy nonsense — need to ensure the source is invalidated when necessary
-		if (is_signals_recorded) {
+		// also needed for when handling inspect logic so we can inspect the correct source signal
+		if (is_signals_recorded || (DEV && inspect_fn)) {
 			// set this so that we don't reset to the parent value if `d`
 			// is invalidated because of `invalidate_inner_signals` (rather
 			// than because the parent or child value changed)
@@ -1858,8 +1888,8 @@ function on_destroy(fn) {
  */
 export function push(props, runes = false) {
 	current_component_context = {
-		// accessors
-		a: null,
+		// exports (and props, if `accessors: true`)
+		x: null,
 		// context
 		c: null,
 		// effects
@@ -1880,14 +1910,15 @@ export function push(props, runes = false) {
 }
 
 /**
- * @param {Record<string, any>} [accessors]
- * @returns {void}
+ * @template {Record<string, any>} T
+ * @param {T} [component]
+ * @returns {T}
  */
-export function pop(accessors) {
+export function pop(component) {
 	const context_stack_item = current_component_context;
 	if (context_stack_item !== null) {
-		if (accessors !== undefined) {
-			context_stack_item.a = accessors;
+		if (component !== undefined) {
+			context_stack_item.x = component;
 		}
 		const effects = context_stack_item.e;
 		if (effects !== null) {
@@ -1899,6 +1930,9 @@ export function pop(accessors) {
 		current_component_context = context_stack_item.p;
 		context_stack_item.m = true;
 	}
+	// Micro-optimization: Don't set .a above to the empty object
+	// so it can be garbage-collected when the return here is unused
+	return component || /** @type {T} */ ({});
 }
 
 /**
@@ -1952,11 +1986,13 @@ export function init() {
 }
 
 /**
+ * Deeply traverse an object and read all its properties
+ * so that they're all reactive in case this is `$state`
  * @param {any} value
  * @param {Set<any>} visited
  * @returns {void}
  */
-function deep_read(value, visited = new Set()) {
+export function deep_read(value, visited = new Set()) {
 	if (typeof value === 'object' && value !== null && !visited.has(value)) {
 		visited.add(value);
 		for (let key in value) {

@@ -8,6 +8,7 @@ import { javascript_visitors } from './visitors/javascript.js';
 import { javascript_visitors_runes } from './visitors/javascript-runes.js';
 import { javascript_visitors_legacy } from './visitors/javascript-legacy.js';
 import { is_state_source, serialize_get_binding } from './utils.js';
+import { render_stylesheet } from '../css/index.js';
 
 /**
  * This function ensures visitor sets don't accidentally clobber each other
@@ -241,9 +242,11 @@ export function client_component(source, analysis, options) {
 		const binding = analysis.instance.scope.get(name);
 		const is_source = binding !== null && is_state_source(binding, state);
 
-		// TODO This is always a getter because the `renamed-instance-exports` test wants it that way.
-		// Should we for code size reasons make it an init in runes mode and/or non-dev mode?
-		return b.get(alias ?? name, [b.return(is_source ? b.call('$.get', b.id(name)) : b.id(name))]);
+		if (is_source || options.dev) {
+			return b.get(alias ?? name, [b.return(is_source ? b.call('$.get', b.id(name)) : b.id(name))]);
+		}
+
+		return b.init(alias ?? name, b.id(name));
 	});
 
 	if (analysis.accessors) {
@@ -271,31 +274,26 @@ export function client_component(source, analysis, options) {
 	]);
 
 	const append_styles =
-		analysis.inject_styles && analysis.stylesheet.has_styles
+		analysis.inject_styles && analysis.css.ast
 			? () =>
 					component_block.body.push(
 						b.stmt(
 							b.call(
 								'$.append_styles',
 								b.id('$$anchor'),
-								b.literal(analysis.stylesheet.id),
-								b.literal(analysis.stylesheet.render(analysis.name, source, options.dev).code)
+								b.literal(analysis.css.hash),
+								b.literal(render_stylesheet(source, analysis, options).code)
 							)
 						)
 					)
 			: () => {};
 
-	if (properties.length > 0) {
-		component_block.body.push(
-			b.var('$$accessors', b.object(properties)),
-			b.stmt(b.call('$.pop', b.id('$$accessors')))
-		);
-		append_styles();
-		component_block.body.push(b.return(b.id('$$accessors')));
-	} else {
-		component_block.body.push(b.stmt(b.call('$.pop')));
-		append_styles();
-	}
+	append_styles();
+	component_block.body.push(
+		properties.length > 0
+			? b.return(b.call('$.pop', b.object(properties)))
+			: b.stmt(b.call('$.pop'))
+	);
 
 	if (analysis.uses_rest_props) {
 		/** @type {string[]} */
